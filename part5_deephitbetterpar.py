@@ -19,14 +19,18 @@ warnings.filterwarnings('ignore')
 # settings up top so they're easy to change. the optuna trial count is the
 # main thing that drives quality vs runtime; everything else is just giving the
 # models a bit more room to converge before early stopping kicks in.
-N_OPTUNA_TRIALS   = 300
-MAX_EPOCHS_OPTUNA = 150
-MAX_EPOCHS_CV     = 400
-PATIENCE_OPTUNA   = 15
-PATIENCE_CV       = 25
+N_OPTUNA_TRIALS   = 100
+MAX_EPOCHS_OPTUNA = 100
+MAX_EPOCHS_CV     = 300
+PATIENCE_OPTUNA   = 10
+PATIENCE_CV       = 20
 NUM_DURATIONS     = 100
 SEED              = 2024
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+print("Python:", sys.executable)
+print("Torch:", torch.__version__, "| GPU available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+
 
 
 # load + the usual followup patch
