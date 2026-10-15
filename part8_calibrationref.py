@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # part8 - calibration curves
 # makes calibration curves (plus the integrated calibration index, ici) for the
-# cif at 5 and 10 years, for both fine-gray and deephit, on the two competing
-# outcomes (cv death = 1, cancer death = 2).
+# cif, for both fine-gray and deephit, on the two competing outcomes
+# (cv death = 1, cancer death = 2).
 #
 # why this exists: the thesis already reports the brier score, but that mixes
 # discrimination and calibration together. the supervisor asked for actual
@@ -10,21 +10,27 @@
 # competing-risks-correct way (aalen-johansen within bins of predicted risk),
 # with a smoothed curve and the ici on top.
 #
+# horizons: the script plots every horizon (5yr / 10yr) for which the fine-gray
+# predictions file has BOTH cif_cv_<h> and cif_cancer_<h>. right now
+# finegray_test_predictions.csv only has the 10yr columns, so only 10yr is
+# plotted. if part 4 is changed to also export cif_cv_5yr / cif_cancer_5yr,
+# the 5yr panels appear automatically - nothing to change here.
+#
 # inputs (all already sitting on disk from the earlier parts):
 #   nhanes_imputed_stacked.csv      - the imputed data (.imp, SEQN, event, time, covars)
 #   finegray_test_predictions.csv   - per-subject fine-gray cifs + the fold column
 #   deephit_best_params.json        - the fixed deephit hyperparameters
-#   (don't need cv_fold_indices.csv here, the folds come from the fg predictions)
 #
 # outputs:
-#   calibration_cv_5yr.png, calibration_cv_10yr.png,
-#   calibration_cancer_5yr.png, calibration_cancer_10yr.png
-#   calibration_combined.png        - all four in a 2x2 panel
+#   calibration_<cause>_<horizon>.png for each available horizon
+#   calibration_combined.png        - all panels (rows = cause, cols = horizon)
 #   calibration_ici_summary.csv     - ici + e50/e90 per model/cause/horizon
 #   calibration_console_summary.txt
+#   dh_oof.pkl                      - cached deephit out-of-fold predictions;
+#                                     delete it if the model / params change
 #
 # it refits deephit on imputation 1 with the same folds as fine-gray, so both
-# models' predictions are out-of-fold and directly comparable. ~5-10 min.
+# models' predictions are out-of-fold and directly comparable.
 
 import numpy as np, pandas as pd, json, warnings, os
 import matplotlib
@@ -42,7 +48,8 @@ from statsmodels.nonparametric.smoothers_lowess import lowess
 SEED = 2024
 NUM_DURATIONS = 100
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-horizons = {"5yr": 60, "10yr": 120}        # months
+DH_CACHE = "dh_oof.pkl"
+all_horizons = {"5yr": 60, "10yr": 120}     # months
 causes  = {1: "Cardiovascular death", 2: "Cancer death"}
 np.random.seed(SEED); torch.manual_seed(SEED)
 
@@ -59,6 +66,18 @@ df_all = pd.read_csv("nhanes_imputed_stacked.csv")
 fg     = pd.read_csv("finegray_test_predictions.csv")     # has the fold column
 with open("deephit_best_params.json") as f: bp = json.load(f)
 folds = fg[["SEQN","fold"]].drop_duplicates()
+
+# only plot horizons the fine-gray file actually has predictions for
+horizons = {h: m for h, m in all_horizons.items()
+            if f"cif_cv_{h}" in fg.columns and f"cif_cancer_{h}" in fg.columns}
+missing = [h for h in all_horizons if h not in horizons]
+if not horizons:
+    raise SystemExit("No cif_cv_<h>/cif_cancer_<h> columns found in "
+                     "finegray_test_predictions.csv. Columns: " + str(list(fg.columns)))
+print("Horizons plotted:", list(horizons))
+if missing:
+    print("Skipped (not in Fine-Gray predictions):", missing,
+          "- export them from part 4 to include them.")
 
 # --- observed cif ----------------------------------------------------------
 # aalen-johansen observed cif for one cause at the horizon, among the people in
@@ -110,9 +129,13 @@ def ici(pred, durations, events, cause, horizon):
     return float(np.mean(diff)), float(np.percentile(diff,50)), float(np.percentile(diff,90))
 
 # --- refit deephit out-of-fold (imputation 1, same folds as fine-gray) -----
+# predictions are made for ALL horizons (cheap), so the cache stays valid if
+# 5yr fine-gray predictions are added later
 def deephit_oof_predictions():
     df = df_all[df_all['.imp']==1].copy().reset_index(drop=True)
-    if 'followup_months' not in df or df['followup_months'].isna().all():
+    if 'followup_months...6' in df.columns:
+        df['followup_months'] = df['followup_months...6']
+    elif 'followup_months' not in df or df['followup_months'].isna().all():
         df['followup_months'] = df['followup_years']*12
     for c in ['race_ethnicity','education','smoking_status']:
         df[c+'_enc'] = LabelEncoder().fit_transform(df[c].astype(str).fillna('Unknown'))
@@ -134,7 +157,7 @@ def deephit_oof_predictions():
         idx=np.clip(np.searchsorted(cuts,dur,side='right')-1,0,n_dur-1)
         return idx.astype('int64'), ev.astype('int64')
     out = pd.DataFrame({'SEQN':df['SEQN']})
-    for hl in horizons: out[f'dh_cv_{hl}']=np.nan; out[f'dh_cancer_{hl}']=np.nan
+    for hl in all_horizons: out[f'dh_cv_{hl}']=np.nan; out[f'dh_cancer_{hl}']=np.nan
     # train on the other 4 folds, predict the held-out one, loop over all folds
     for fold in sorted(df['fold'].dropna().unique()):
         tr=df['fold']!=fold; te=df['fold']==fold
@@ -146,31 +169,43 @@ def deephit_oof_predictions():
         n=len(Xtr); nv=int(.15*n); pm=np.random.RandomState(SEED+int(fold)).permutation(n)
         Xt,Xv=Xtr[pm[nv:]],Xtr[pm[:nv]]
         yt=(ytr[0][pm[nv:]],ytr[1][pm[nv:]]); yv=(ytr[0][pm[:nv]],ytr[1][pm[:nv]])
-        m=DeepHit(net(),tt.optim.Adam,alpha=bp['alpha'],sigma=bp['sigma'],duration_index=cuts)
+        m=DeepHit(net(),tt.optim.Adam,alpha=bp['alpha'],sigma=bp['sigma'],
+                  duration_index=cuts,device=DEVICE)
         m.optimizer.set_lr(bp['lr'])
         m.fit(Xt,yt,batch_size=bp['batch_size'],epochs=300,
               callbacks=[tt.callbacks.EarlyStopping(patience=20)],val_data=(Xv,yv),verbose=False)
         cif=m.predict_cif(Xte)            # [risk, time, subj]
         teidx=df.index[te]
-        for hl,hm in horizons.items():
+        for hl,hm in all_horizons.items():
             ti=min(np.searchsorted(cuts,hm,side='right')-1,n_dur-1)
             out.loc[teidx,f'dh_cv_{hl}']     = cif[0][ti,:]
             out.loc[teidx,f'dh_cancer_{hl}'] = cif[1][ti,:]
         print(f"  DeepHit fold {int(fold)} done")
     return df[['SEQN','followup_months','event']].merge(out,on='SEQN')
 
-print("\nRefitting DeepHit out-of-fold (imputation 1)...")
-dh = deephit_oof_predictions()
-base = dh.merge(fg, on='SEQN', how='inner')
+if os.path.exists(DH_CACHE):
+    print(f"\nLoading cached DeepHit predictions from {DH_CACHE} "
+          "(delete it to force a refit)")
+    dh = pd.read_pickle(DH_CACHE)
+else:
+    print("\nRefitting DeepHit out-of-fold (imputation 1)...")
+    dh = deephit_oof_predictions()
+    dh.to_pickle(DH_CACHE)
+
+# keep the outcome columns from the deephit side; drop fg's copies so the merge
+# doesn't rename them to _x/_y
+overlap = [c for c in fg.columns if c in dh.columns and c != 'SEQN']
+base = dh.merge(fg.drop(columns=overlap), on='SEQN', how='inner')
+print(f"  merged {len(base)} rows (dh={len(dh)}, fg={len(fg)}); dropped from fg: {overlap}")
 
 # --- plots + ici -----------------------------------------------------------
 plt.rcParams.update({'font.size':10,'figure.dpi':150})
 ici_rows=[]; panels=[]
+dur=base['followup_months'].values; ev=base['event'].values
 for cause, clab in causes.items():
     cname = 'cv' if cause==1 else 'cancer'
     for hl, hm in horizons.items():
         fg_col=f'cif_{cname}_{hl}'; dh_col=f'dh_{cname}_{hl}'
-        dur=base['followup_months'].values; ev=base['event'].values
         fig,ax=plt.subplots(figsize=(5.2,5.0))
         # work out both models' calibration points first so the axes can be
         # zoomed to the data actually plotted, not stretched out to some lone
@@ -198,9 +233,10 @@ for cause, clab in causes.items():
         fn=f'calibration_{cname}_{hl}.png'; fig.savefig(fn,bbox_inches='tight'); plt.close(fig)
         panels.append(fn); print("  wrote",fn)
 
-# stitch the four panels into one 2x2 figure
-fig,axes=plt.subplots(2,2,figsize=(10,10))
-for axp,fn in zip(axes.ravel(),panels):
+# stitch the panels into one figure: rows = cause, columns = horizon
+nrows, ncols = len(causes), len(horizons)
+fig,axes=plt.subplots(nrows,ncols,figsize=(5*ncols,5*nrows))
+for axp,fn in zip(np.atleast_1d(axes).ravel(),panels):
     axp.imshow(plt.imread(fn)); axp.axis('off')
 fig.tight_layout(); fig.savefig('calibration_combined.png',dpi=150,bbox_inches='tight'); plt.close(fig)
 print("  wrote calibration_combined.png")
@@ -208,11 +244,14 @@ print("  wrote calibration_combined.png")
 ici_df=pd.DataFrame(ici_rows); ici_df.to_csv('calibration_ici_summary.csv',index=False)
 lines=["CALIBRATION SUMMARY (Integrated Calibration Index)","="*52,
        "ICI = mean |predicted - observed|; lower is better.",""]
+if missing:
+    lines += [f"Note: horizons not available in Fine-Gray predictions: {missing}", ""]
 for (c,h),g in ici_df.groupby(['cause','horizon']):
     lines.append(f"{c}, {h}:")
     for _,r in g.iterrows():
         lines.append(f"   {r['model']:10s} ICI={r['ICI']:.4f}  E50={r['E50']:.4f}  E90={r['E90']:.4f}")
     lines.append("")
-open('calibration_console_summary.txt','w').write("\n".join(lines))
+with open('calibration_console_summary.txt','w') as f:
+    f.write("\n".join(lines))
 print("\n".join(lines))
 print("DONE. Send back calibration_combined.png and calibration_ici_summary.csv.")
