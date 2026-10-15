@@ -77,11 +77,11 @@ for (imp_num in 1:20) {
   df_imp <- df_all %>% filter(.imp == imp_num)
   df_imp$followup_months <- df_imp$followup_years * 12
   X_imp <- prepare_covariates(df_imp)
-
+  
   # one fit per cause: failcode=1 is cv death, failcode=2 is cancer death
   fit_cv     <- crr(df_imp$followup_months, df_imp$event, X_imp, failcode=1, cencode=0)
   fit_cancer <- crr(df_imp$followup_months, df_imp$event, X_imp, failcode=2, cencode=0)
-
+  
   all_coefs[[imp_num]] <- list(cv = fit_cv$coef, cancer = fit_cancer$coef)
   all_ses[[imp_num]]   <- list(cv = sqrt(diag(fit_cv$var)), cancer = sqrt(diag(fit_cancer$var)))
 }
@@ -163,51 +163,55 @@ for (fold in 1:5) {
   cat(sprintf("\n  Fold %d/5:\n", fold))
   train_idx <- which(fold_ids != fold)
   test_idx  <- which(fold_ids == fold)
-
+  
   fit_cv     <- crr(ftime[train_idx], fstatus[train_idx], X[train_idx,], failcode=1, cencode=0)
   fit_cancer <- crr(ftime[train_idx], fstatus[train_idx], X[train_idx,], failcode=2, cencode=0)
-
+  
   pred_cv     <- predict(fit_cv,     cov1 = X[test_idx,])
   pred_cancer <- predict(fit_cancer, cov1 = X[test_idx,])
-
+  
   # predict() returns a matrix with the time grid in column 1 and the cifs in
   # the rest, so split those apart
   pred_cv_times  <- pred_cv[,1];  pred_cv_cif  <- pred_cv[,-1, drop=FALSE]
   pred_can_times <- pred_cancer[,1]; pred_can_cif <- pred_cancer[,-1, drop=FALSE]
-
+  
+  # per-subject predictions for this fold's test set; one cif column per cause
+  # and horizon gets added inside the horizon loop below. the python scripts
+  # (parts 7 and 8) read these to compare against deephit.
+  fold_preds <- data.frame(
+    SEQN = df$SEQN[test_idx], fold = fold,
+    followup_months = ftime[test_idx], event = fstatus[test_idx]
+  )
+  
   for (h in seq_along(horizons_months)) {
     t_h <- horizons_months[h]; t_l <- horizons_labels[h]
-
+    
     # find the last time point at or before the horizon and read the cif there
-    cv_ti  <- max(which(pred_cv_times  <= t_h), na.rm=TRUE)
-    can_ti <- max(which(pred_can_times <= t_h), na.rm=TRUE)
-
+    cv_ti  <- suppressWarnings(max(which(pred_cv_times  <= t_h), na.rm=TRUE))
+    can_ti <- suppressWarnings(max(which(pred_can_times <= t_h), na.rm=TRUE))
+    
     cif_cv_h  <- if(is.finite(cv_ti))  as.numeric(pred_cv_cif[cv_ti,])   else rep(0, length(test_idx))
     cif_can_h <- if(is.finite(can_ti)) as.numeric(pred_can_cif[can_ti,]) else rep(0, length(test_idx))
-
+    
     ctd_cv  <- compute_ctd(cif_cv_h,  ftime[test_idx], fstatus[test_idx], 1, t_h)
     ctd_can <- compute_ctd(cif_can_h, ftime[test_idx], fstatus[test_idx], 2, t_h)
     bs_cv   <- compute_brier(cif_cv_h,  ftime[test_idx], fstatus[test_idx], 1, t_h)
     bs_can  <- compute_brier(cif_can_h, ftime[test_idx], fstatus[test_idx], 2, t_h)
-
+    
     cat(sprintf("    %s: C-td(CV)=%.3f, C-td(Cancer)=%.3f\n", t_l, ctd_cv, ctd_can))
-
+    
     cv_results <- rbind(cv_results, data.frame(
       fold=fold, horizon=t_l, horizon_months=t_h,
       ctd_cv=ctd_cv, ctd_cancer=ctd_can, brier_cv=bs_cv, brier_cancer=bs_can
     ))
+    
+    # same cifs that were just evaluated, stored per subject:
+    # cif_cv_5yr, cif_cancer_5yr, cif_cv_10yr, cif_cancer_10yr
+    fold_preds[[paste0("cif_cv_", t_l)]]     <- cif_cv_h
+    fold_preds[[paste0("cif_cancer_", t_l)]] <- cif_can_h
   }
-
-  # also keep the 10-year predictions per subject. the python scripts (parts 7
-  # and 8) need these to compare against deephit, so they get exported below.
-  cv10  <- max(which(pred_cv_times  <= 120), na.rm=TRUE)
-  can10 <- max(which(pred_can_times <= 120), na.rm=TRUE)
-  all_test_preds <- rbind(all_test_preds, data.frame(
-    SEQN = df$SEQN[test_idx], fold = fold,
-    followup_months = ftime[test_idx], event = fstatus[test_idx],
-    cif_cv_10yr     = if(is.finite(cv10))  as.numeric(pred_cv_cif[cv10,])   else 0,
-    cif_cancer_10yr = if(is.finite(can10)) as.numeric(pred_can_cif[can10,]) else 0
-  ))
+  
+  all_test_preds <- rbind(all_test_preds, fold_preds)
 }
 
 
@@ -222,3 +226,4 @@ for (h in horizons_labels) {
 write_csv(cv_results, "finegray_cv_performance.csv")
 write_csv(all_test_preds, "finegray_test_predictions.csv")
 cat("\nExported: finegray_cv_performance.csv, finegray_test_predictions.csv\n")
+cat("Prediction columns:", paste(names(all_test_preds), collapse = ", "), "\n")
